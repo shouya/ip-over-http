@@ -162,7 +162,7 @@ int tun_forward(int fd) {
 
   memset(data, 0, sizeof(data));
 
-  read(fd, &data, mtu);
+  read(fd, &data, sizeof(data));
 
   if (iph->protocol != IPPROTO_TCP) {
     fprintf(stderr,
