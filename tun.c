@@ -68,7 +68,7 @@ int redsocks_alloc(const char *tun_addr, int port) {
   memset(&saddr, 0, sizeof(saddr));
   saddr.sin_family = AF_INET;
   inet_aton(tun_addr, &saddr.sin_addr);
-  saddr.sin_port = htons(port);
+  saddr.sin_port = port;
 
   bind(fd, (struct sockaddr *)&saddr, sizeof(saddr));
   listen(fd, 10);
@@ -120,10 +120,20 @@ unsigned short ip_csum(const char *buf, int sz) {
 
 unsigned short tcp_csum(const char *buf, int sz) {
   /* http://locklessinc.com/articles/tcp_checksum/ */
+  /* https://tools.ietf.org/html/rfc793 */
+  struct iphdr *iph = (struct iphdr *)buf;
   unsigned int sum = 0;
   int i;
 
-  for (i = 0; i < sz - 1; i += 2) {
+  /* pseudo-header */
+  sum += iph->saddr & 0xFFFF;
+  sum += (iph->saddr >> 16) & 0xFFFF;
+  sum += iph->daddr & 0xFFFF;
+  sum += (iph->daddr >> 16) & 0xFFFF;
+  sum += ntohs((unsigned short)iph->protocol);
+  sum += ntohs(ntohs(iph->tot_len) - sizeof(*iph));
+
+  for (i = sizeof(*iph); i < sz - 1; i += 2) {
     sum += *(unsigned short *)&buf[i];
   }
 
@@ -133,6 +143,7 @@ unsigned short tcp_csum(const char *buf, int sz) {
 
   while (sum >> 16)
     sum = (sum & 0xFFFF) + (sum >> 16);
+  sum &= 0xFFFF;
 
   return ~sum;
 }
@@ -140,21 +151,20 @@ unsigned short tcp_csum(const char *buf, int sz) {
 int mangle_packet(struct iphdr *iph, struct tcphdr *tcph,
                   in_addr_t sip, int sport,
                   in_addr_t dip, int dport) {
+  fprintf(stderr, "MANGLE: %s:%d ",
+          inet_ntoa(*(struct in_addr *)&sip), sport);
+  fprintf(stderr, "-> %s:%d from tun\n",
+          inet_ntoa(*(struct in_addr *)&dip), dport);
+
   iph->saddr = sip;
   iph->daddr = dip;
   iph->check = 0;
-  tcph->source = htons(sport);
-  tcph->dest = htons(dport);
+  tcph->source = ntohs(sport);
+  tcph->dest = ntohs(dport);
   tcph->check = 0;
 
+  tcph->check = tcp_csum((char *)iph, ntohs(iph->tot_len));
   iph->check = ip_csum((char *)iph, sizeof(*iph));
-
-  tcph->check = tcp_csum((char *)tcph, ntohs(iph->tot_len) - sizeof(*iph));
-
-  fprintf(stderr,
-          "MANGLE: %s:%d -> %s:%d\n",
-          inet_ntoa(*(struct in_addr *)&sip), sport,
-          inet_ntoa(*(struct in_addr *)&dip), dport);
 
   return 0;
 }
@@ -163,17 +173,13 @@ int tun_forward(int fd) {
   char data[4096];
   int sport, dport;
   in_addr_t sip, dip;
-  int nbytes;
 
   struct iphdr *iph = (struct iphdr *)data;
   struct tcphdr *tcph = (struct tcphdr *)&data[sizeof(*iph)];
 
   memset(data, 0, sizeof(data));
 
-  nbytes = read(fd, &data, sizeof(data));
-
-  fprintf(stderr, "n bytes [%d]\n", nbytes);
-  fprintf(stderr, "get: %02hhx %02hhx %02hhx\n", data[1], data[2], data[3], data[4]);
+  read(fd, &data, sizeof(data));
 
   if (iph->protocol != IPPROTO_TCP) {
     fprintf(stderr,
@@ -184,12 +190,12 @@ int tun_forward(int fd) {
 
   sport = ntohs(tcph->source);
   dport = ntohs(tcph->dest);
-  sip = iph->saddr;
   dip = iph->daddr;
+  sip = iph->saddr;
 
-  fprintf(stderr,
-          "LOG: read pack %s:%d -> %s:%d from tun\n",
-          inet_ntoa(*(struct in_addr *)&sip), sport,
+  fprintf(stderr, "LOG: read pack %s:%d ",
+          inet_ntoa(*(struct in_addr *)&sip), sport);
+  fprintf(stderr, "-> %s:%d from tun\n",
           inet_ntoa(*(struct in_addr *)&dip), dport);
 
   if (sip == inet_addr(redsocks_ip) &&
@@ -231,7 +237,7 @@ void redsocks_client(int client_fd) {
 
   proxy_addr.sin_family = AF_INET;
   inet_aton(http_proxy_ip, &proxy_addr.sin_addr);
-  proxy_addr.sin_port = htons(http_proxy_port);
+  proxy_addr.sin_port = http_proxy_port;
 
   if (!connect(proxy_fd,
                (struct sockaddr *)&proxy_addr,
@@ -241,7 +247,7 @@ void redsocks_client(int client_fd) {
   }
 
   getpeername(client_fd, (struct sockaddr *)&source_addr, NULL);
-  source_port = htons(source_addr.sin_port);
+  source_port = source_addr.sin_port;
 
   memset(buf, 0, sizeof(buf));
   snprintf(buf, 2000,
@@ -301,7 +307,6 @@ void redsocks_client(int client_fd) {
 }
 
 
-
 int loop(int tunfd, int redsocksfd) {
   fd_set active_fd_set, read_fd_set;
   int i, nsel;
@@ -327,14 +332,13 @@ int loop(int tunfd, int redsocksfd) {
 
       if (i == tunfd) {
         tun_forward(tunfd);
-      } else if (i == redsocksfd) {
+      } else {
         int cfd = redsocks_accept(redsocksfd);
 
         if (fork() == 0) {
           close(tunfd);
           close(redsocksfd);
           redsocks_client(cfd);
-          exit(0);
         } else {
           close(cfd);
         }
@@ -353,7 +357,7 @@ int main() {
   }
   set_addr(dev, tun_ip, mask, mtu);
 
-  redsocksfd = redsocks_alloc(redsocks_ip, redsocks_port);
+  redsocksfd = redsocks_alloc("10.45.99.1", redsocks_port);
   if (redsocksfd < 0) {
     perror("redsocks_alloc");
     exit(-1);
