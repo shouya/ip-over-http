@@ -68,7 +68,7 @@ int redsocks_alloc(const char *tun_addr, int port) {
   memset(&saddr, 0, sizeof(saddr));
   saddr.sin_family = AF_INET;
   inet_aton(tun_addr, &saddr.sin_addr);
-  saddr.sin_port = port;
+  saddr.sin_port = ntohs(port);
 
   bind(fd, (struct sockaddr *)&saddr, sizeof(saddr));
   listen(fd, 10);
@@ -98,7 +98,7 @@ int redsocks_accept(int fd) {
   socklen_t len = sizeof(caddr);
 
   cfd = accept(fd, (struct sockaddr *)&caddr, &len);
-  fprintf(stderr, "LOG: redsocks get connection from %s:%hd\n",
+  fprintf(stderr, "LOG: redsocks get connection from %s:%hu\n",
           inet_ntoa(caddr.sin_addr),
           ntohs(caddr.sin_port));
   return cfd;
@@ -237,7 +237,7 @@ void redsocks_client(int client_fd) {
 
   proxy_addr.sin_family = AF_INET;
   inet_aton(http_proxy_ip, &proxy_addr.sin_addr);
-  proxy_addr.sin_port = http_proxy_port;
+  proxy_addr.sin_port = ntohs(http_proxy_port);
 
   if (!connect(proxy_fd,
                (struct sockaddr *)&proxy_addr,
@@ -247,7 +247,7 @@ void redsocks_client(int client_fd) {
   }
 
   getpeername(client_fd, (struct sockaddr *)&source_addr, NULL);
-  source_port = source_addr.sin_port;
+  source_port = ntohs(source_addr.sin_port);
 
   memset(buf, 0, sizeof(buf));
   snprintf(buf, 2000,
