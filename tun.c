@@ -12,12 +12,24 @@
 #include <linux/tcp.h>
 #include <linux/in.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include <stdio.h>
 #include <search.h>
 
-/* https://www.kernel.org/doc/Documentation/networking/tuntap.txt */
+#define LOG(...)                                                        \
+  do {                                                                  \
+    if (!quiet) {                                                       \
+      fprintf(stderr, "LOG: " __VA_ARGS__);                             \
+    }                                                                   \
+  } while (0);
+#define ERROR(...) fprintf(stderr, "ERROR: " __VA_ARGS__);
+#define DEBUG(n, str, ...)                                              \
+  do {                                                                  \
+    if (debug_level >= n) {                                             \
+      fprintf(stderr, "DEBUG(%d): " str, n, __VA_ARGS__);               \
+    }                                                                   \
+  }while (0);
 
 const char dev[IFNAMSIZ] = "tun0";
 const char *tun_ip = "10.45.99.1";
@@ -34,7 +46,11 @@ int nat_port[65535];
 const char *http_proxy_ip = "127.0.0.1";
 int http_proxy_port = 16808;
 
+int quiet = 0;
+int debug_level = 0;
+
 int tun_alloc(const char *dev) {
+  /* https://www.kernel.org/doc/Documentation/networking/tuntap.txt */
   struct ifreq ifr;
   int fd;
 
@@ -52,7 +68,8 @@ int tun_alloc(const char *dev) {
     return -1;
   }
 
-  fprintf(stderr, "LOG: TUN device %s allocated: %d\n", dev, fd);
+  LOG("TUN device %s allocated: %d\n", dev, fd);
+
   return fd;
 }
 
@@ -73,9 +90,9 @@ int redsocks_alloc(const char *tun_addr, int port) {
   bind(fd, (struct sockaddr *)&saddr, sizeof(saddr));
   listen(fd, 1);
 
-  fprintf(stderr, "LOG: Redsocks server started at %s:%d\n",
-          redsocks_ip,
-          redsocks_port);
+  LOG("Redsocks server started at %s:%d\n",
+      redsocks_ip,
+      redsocks_port);
   return fd;
 }
 
@@ -83,14 +100,19 @@ int set_addr(const char *dev, const char* ip, int mask, int mtu) {
   char buf[100];
 
   snprintf(buf, 100, "ip addr add %s/%d dev %s", ip, mask, dev);
-  system(buf);
+  if (system(buf) < 0) {
+    ERROR("failed setting up address for %s\n", dev);
+  }
 
   snprintf(buf, 100, "ip link set %s up", dev);
-  system(buf);
+  if (system(buf) < 0)
+    ERROR("failed enabling %s\n", dev);
 
   snprintf(buf, 100, "ip link set %s mtu %d", dev, mtu);
+  if (system(buf) < 0)
+    ERROR("failed setting up MTU (%d) for %s\n", mtu, dev);
 
-  fprintf(stderr, "LOG: set addr %s/%d for %s\n", ip, mask, dev);
+  LOG("set addr %s/%d for %s\n", ip, mask, dev);
 
   return 0;
 }
@@ -181,12 +203,12 @@ int tun_forward(int fd) {
 
   memset(data, 0, sizeof(data));
 
-  read(fd, &data, sizeof(data));
+  if (read(fd, &data, sizeof(data)) < 0) {
+    ERROR("Failed reading from TUN device\n");
+  }
 
   if (iph->protocol != IPPROTO_TCP) {
-    fprintf(stderr,
-            "LOG: non-TCP protocol pack [%d], dropping\n",
-            iph->protocol);
+    DEBUG(1, "non-TCP protocol pack [%d], dropping\n", iph->protocol);
     return -1;
   }
 
@@ -195,10 +217,14 @@ int tun_forward(int fd) {
   dip = iph->daddr;
   sip = iph->saddr;
 
+  /*
   fprintf(stderr, "LOG: read pack %s:%d ",
           inet_ntoa(*(struct in_addr *)&sip), sport);
   fprintf(stderr, "-> %s:%d from tun\n",
           inet_ntoa(*(struct in_addr *)&dip), dport);
+  */
+  LOG("read pack -> %s:%d\n",
+      inet_ntoa(*(struct in_addr *)&dip), dport);
 
   if (sip == inet_addr(redsocks_ip) &&
       sport == redsocks_port) {
@@ -219,7 +245,8 @@ int tun_forward(int fd) {
     mangle_packet(iph, tcph, sip, sport, dip, dport);
   }
 
-  write(fd, &data, mtu);
+  if (write(fd, &data, mtu) < 0)
+    ERROR("failed writing to tun device");
 
   return 0;
 }
@@ -267,14 +294,17 @@ void redsocks_client(int client_fd) {
            nat_port[source_port]);
 
 
-  write(proxy_fd, buf, strlen(buf));
-  read(proxy_fd, buf, sizeof(buf));
+  if (write(proxy_fd, buf, strlen(buf)) < 0)
+    ERROR("failed sending data to proxy\n");
+
+  if (read(proxy_fd, buf, sizeof(buf)) < 0)
+    ERROR("proxy server closed unexpectedly\n");
+
 
 
   if (strncmp(buf, "HTTP", 4) || strncmp(&buf[9], "200", 3)) {
-    fprintf(stderr,
-            "ERROR: HTTP proxy server gives non-200 status [%s]\n",
-            buf);
+    ERROR("HTTP proxy server gives non-200 status [%s]\n",
+          buf);
     close(proxy_fd);
   }
 
@@ -304,16 +334,20 @@ void redsocks_client(int client_fd) {
 
       if (i == client_fd) {
         buf_size = read(client_fd, buf, sizeof(buf));
-        if (buf_size > 0)
-          write(proxy_fd, buf, buf_size);
-        else
+        if (buf_size > 0) {
+          if (write(proxy_fd, buf, buf_size) < 0)
+            ERROR("failed communicating with HTTP proxy\n");
+        } else {
           goto done;
+        }
       } else {
         buf_size = read(proxy_fd, buf, sizeof(buf));
-        if (buf_size > 0)
-          write(client_fd, buf, buf_size);
-        else
+        if (buf_size > 0) {
+          if (write(client_fd, buf, buf_size) < 0)
+            ERROR("failed communicating with HTTP proxy\n");
+        } else {
           goto done;
+        }
       }
     }
   }
