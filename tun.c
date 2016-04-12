@@ -31,7 +31,7 @@
     }                                                                   \
   }while (0);
 
-const char dev[IFNAMSIZ] = "tun0";
+char *tun_device;
 const char *tun_ip = "10.45.99.1";
 int mask = 24;
 int mtu = 1500;
@@ -49,7 +49,7 @@ int http_proxy_port = 16808;
 int quiet = 0;
 int debug_level = 0;
 
-int tun_alloc(const char *dev) {
+int tun_alloc(char *dev) {
   /* https://www.kernel.org/doc/Documentation/networking/tuntap.txt */
   struct ifreq ifr;
   int fd;
@@ -68,7 +68,9 @@ int tun_alloc(const char *dev) {
     return -1;
   }
 
-  LOG("TUN device %s allocated: %d\n", dev, fd);
+  strncpy(dev, ifr.ifr_name, IFNAMSIZ);
+
+  LOG("TUN device %s allocated, fd: %d\n", dev, fd);
 
   return fd;
 }
@@ -217,14 +219,12 @@ int tun_forward(int fd) {
   dip = iph->daddr;
   sip = iph->saddr;
 
-  /*
-  fprintf(stderr, "LOG: read pack %s:%d ",
-          inet_ntoa(*(struct in_addr *)&sip), sport);
-  fprintf(stderr, "-> %s:%d from tun\n",
-          inet_ntoa(*(struct in_addr *)&dip), dport);
-  */
-  LOG("read pack -> %s:%d\n",
-      inet_ntoa(*(struct in_addr *)&dip), dport);
+  if (!quiet) {
+    fprintf(stderr, "LOG: read pack %s:%d ",
+            inet_ntoa(*(struct in_addr *)&sip), sport);
+    fprintf(stderr, "-> %s:%d\n",
+            inet_ntoa(*(struct in_addr *)&dip), dport);
+  }
 
   if (sip == inet_addr(redsocks_ip) &&
       sport == redsocks_port) {
@@ -296,23 +296,14 @@ void redsocks_client(int client_fd) {
 
   if (write(proxy_fd, buf, strlen(buf)) < 0)
     ERROR("failed sending data to proxy\n");
-
   if (read(proxy_fd, buf, sizeof(buf)) < 0)
     ERROR("proxy server closed unexpectedly\n");
-
-
 
   if (strncmp(buf, "HTTP", 4) || strncmp(&buf[9], "200", 3)) {
     ERROR("HTTP proxy server gives non-200 status [%s]\n",
           buf);
     close(proxy_fd);
   }
-
-  /*
-  buf_size = read(client_fd, buf, sizeof(buf));
-  printf("read from client: (%d)[%s], writing to proxy\n", buf_size, buf);
-  write(proxy_fd, buf, buf_size);
-  */
 
   FD_ZERO(&active_set);
   FD_SET(proxy_fd, &active_set);
@@ -414,6 +405,7 @@ int print_help(const char *argv0) {
   puts("\nOPTIONS:");
   puts("    -x <http_proxy_ip>");
   puts("    -p <http_proxy_port>");
+  puts("    -i <tun_dev>\tSpecify TUN device name");
   puts("    -h\tDisplay this help");
   exit(0);
 }
@@ -431,6 +423,9 @@ int parse_arg(int argc, char **argv) {
       break;
     case 'p':
       http_proxy_port = atoi(optarg);
+      break;
+    case 'i':
+      tun_device = strdup(optarg);
       break;
     case '?':
       fprintf(stderr, "Invalid option `-%c'\n", optopt);
@@ -455,14 +450,21 @@ int print_config() {
 int main(int argc, char **argv) {
   int tunfd, redsocksfd;
 
-  parse_arg(argc, argv);
+  if (parse_arg(argc, argv) < 0) {
+    ERROR("Invalid arguments\n");
+    abort();
+  }
   print_config();
 
-  if ((tunfd = tun_alloc(dev)) < 0) {
+  if (!tun_device)
+    tun_device = malloc(IFNAMSIZ);
+
+
+  if ((tunfd = tun_alloc(tun_device)) < 0) {
     perror("tun_alloc");
     exit(-1);
   }
-  set_addr(dev, tun_ip, mask, mtu);
+  set_addr(tun_device, tun_ip, mask, mtu);
 
   redsocksfd = redsocks_alloc("10.45.99.1", redsocks_port);
   if (redsocksfd < 0) {
