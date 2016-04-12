@@ -2,10 +2,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <linux/ip.h>
@@ -213,6 +213,8 @@ int tun_forward(int fd) {
     nat_ip[sport] = dip;
     nat_port[sport] = dport;
 
+    printf("Saving NAT: %u -> %s:%u\n", sport, inet_ntoa(*(struct in_addr *)&dip), dport);
+
     sip = inet_addr(fake_ip);
     dip = inet_addr(redsocks_ip);
     dport = redsocks_port;
@@ -231,6 +233,7 @@ void redsocks_client(int client_fd) {
   int source_port;
   char buf[2000];
   int i, buf_size, nsel;
+  unsigned int addr_len;
   fd_set active_set, rd_set;
 
   proxy_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -239,36 +242,49 @@ void redsocks_client(int client_fd) {
   inet_aton(http_proxy_ip, &proxy_addr.sin_addr);
   proxy_addr.sin_port = ntohs(http_proxy_port);
 
-  if (!connect(proxy_fd,
-               (struct sockaddr *)&proxy_addr,
-               sizeof(struct sockaddr_in))) {
-    perror("connect");
+  if (connect(proxy_fd,
+              (struct sockaddr *)&proxy_addr,
+              sizeof(struct sockaddr_in))) {
+    perror("redsocks_client");
     exit(-1);
   }
 
-  getpeername(client_fd, (struct sockaddr *)&source_addr, NULL);
+  addr_len = sizeof(source_addr);
+  if (getpeername(client_fd,
+                  (struct sockaddr *)&source_addr,
+                  &addr_len) < 0) {
+    perror("redsocks_client");
+    exit(-1);
+  }
   source_port = ntohs(source_addr.sin_port);
 
   memset(buf, 0, sizeof(buf));
+
   snprintf(buf, 2000,
            "CONNECT %s:%d HTTP/1.1\r\n"
            "Host: %s:%d\r\n\r\n",
            inet_ntoa(*(struct in_addr *)&nat_ip[source_port]),
-           source_port,
+           nat_port[source_port],
            inet_ntoa(*(struct in_addr *)&nat_ip[source_port]),
-           source_port);
-  fprintf(stderr, "%s", buf);
+           nat_port[source_port]);
+  fprintf(stderr, "CONN: \n%s\n", buf);
 
 
   write(proxy_fd, buf, strlen(buf));
   read(proxy_fd, buf, sizeof(buf));
 
-  if (!strncmp(buf, "HTTP/1.1 200", strlen("HTTP/1.1 200"))) {
+
+  if (strncmp(buf, "HTTP", 4) || strncmp(&buf[9], "200", 3)) {
     fprintf(stderr,
             "ERROR: HTTP proxy server gives non-200 status [%s]\n",
             buf);
     close(proxy_fd);
   }
+
+
+  buf_size = read(client_fd, buf, sizeof(buf));
+  printf("read from client: (%d)[%s], writing to proxy\n", buf_size, buf);
+  write(proxy_fd, buf, buf_size);
 
   FD_ZERO(&active_set);
   FD_SET(proxy_fd, &active_set);
@@ -276,15 +292,21 @@ void redsocks_client(int client_fd) {
 
   while (1) {
     rd_set = active_set;
-    nsel = select(2, &rd_set, 0, 0, 0);
+    puts("what....");
+    nsel = select(FD_SETSIZE, &rd_set, 0, 0, 0);
+    puts("selecting....");
     if (nsel < 0) {
+      puts("err selcting");
       close(proxy_fd);
       close(client_fd);
       break;
     } else if (nsel == 0) {
+      puts("no reply selecting");
       sleep(0);
       continue;
     }
+
+    printf("Got %d records!\n", nsel);
 
     for (i = 0; i < FD_SETSIZE; ++i) {
       if (!FD_ISSET(i, &rd_set))
@@ -292,13 +314,21 @@ void redsocks_client(int client_fd) {
 
       if (i == client_fd) {
         buf_size = read(client_fd, buf, sizeof(buf));
-        write(proxy_fd, buf, buf_size);
+        if (buf_size > 0)
+          write(proxy_fd, buf, buf_size);
+        else
+          goto done;
       } else {
         buf_size = read(proxy_fd, buf, sizeof(buf));
-        write(client_fd, buf, buf_size);
+        if (buf_size > 0)
+          write(client_fd, buf, buf_size);
+        else
+          goto done;
       }
     }
   }
+
+ done:
 
   close(proxy_fd);
   close(client_fd);
@@ -334,12 +364,19 @@ int loop(int tunfd, int redsocksfd) {
         tun_forward(tunfd);
       } else {
         int cfd = redsocks_accept(redsocksfd);
+        int pid;
 
-        if (fork() == 0) {
-          close(tunfd);
-          close(redsocksfd);
-          redsocks_client(cfd);
+        if ((pid = fork()) == 0) {
+          /* use client to handle connection */
+          if (fork()) {
+            exit(0);
+          } else {
+            close(tunfd);
+            close(redsocksfd);
+            redsocks_client(cfd);
+          }
         } else {
+          waitpid(pid, NULL, 0);
           close(cfd);
         }
       }
