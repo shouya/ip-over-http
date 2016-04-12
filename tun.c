@@ -52,7 +52,7 @@ int tun_alloc(const char *dev) {
     return -1;
   }
 
-  fprintf(stderr, "%s allocated: %d\n", dev, fd);
+  fprintf(stderr, "LOG: TUN device %s allocated: %d\n", dev, fd);
   return fd;
 }
 
@@ -71,8 +71,11 @@ int redsocks_alloc(const char *tun_addr, int port) {
   saddr.sin_port = ntohs(port);
 
   bind(fd, (struct sockaddr *)&saddr, sizeof(saddr));
-  listen(fd, 10);
+  listen(fd, 1);
 
+  fprintf(stderr, "LOG: Redsocks server started at %s:%d\n",
+          redsocks_ip,
+          redsocks_port);
   return fd;
 }
 
@@ -96,11 +99,8 @@ int redsocks_accept(int fd) {
   struct sockaddr_in caddr;
   int cfd;
   socklen_t len = sizeof(caddr);
-
   cfd = accept(fd, (struct sockaddr *)&caddr, &len);
-  fprintf(stderr, "LOG: redsocks get connection from %s:%hu\n",
-          inet_ntoa(caddr.sin_addr),
-          ntohs(caddr.sin_port));
+
   return cfd;
 }
 
@@ -151,10 +151,12 @@ unsigned short tcp_csum(const char *buf, int sz) {
 int mangle_packet(struct iphdr *iph, struct tcphdr *tcph,
                   in_addr_t sip, int sport,
                   in_addr_t dip, int dport) {
+  /*
   fprintf(stderr, "MANGLE: %s:%d ",
           inet_ntoa(*(struct in_addr *)&sip), sport);
   fprintf(stderr, "-> %s:%d from tun\n",
           inet_ntoa(*(struct in_addr *)&dip), dport);
+  */
 
   iph->saddr = sip;
   iph->daddr = dip;
@@ -200,7 +202,6 @@ int tun_forward(int fd) {
 
   if (sip == inet_addr(redsocks_ip) &&
       sport == redsocks_port) {
-    fprintf(stderr, "FROM REDSOCKS\n");
     /* packet is from redsocks */
     if ((sip = nat_ip[dport]) == 0)
       return -1;
@@ -208,12 +209,9 @@ int tun_forward(int fd) {
     dip = inet_addr(tun_ip);
     mangle_packet(iph, tcph, sip, sport, dip, dport);
   } else {
-    fprintf(stderr, "REAL PACKET\n");
     /* packet is to be forwarded */
     nat_ip[sport] = dip;
     nat_port[sport] = dport;
-
-    printf("Saving NAT: %u -> %s:%u\n", sport, inet_ntoa(*(struct in_addr *)&dip), dport);
 
     sip = inet_addr(fake_ip);
     dip = inet_addr(redsocks_ip);
@@ -267,7 +265,6 @@ void redsocks_client(int client_fd) {
            nat_port[source_port],
            inet_ntoa(*(struct in_addr *)&nat_ip[source_port]),
            nat_port[source_port]);
-  fprintf(stderr, "CONN: \n%s\n", buf);
 
 
   write(proxy_fd, buf, strlen(buf));
@@ -281,10 +278,11 @@ void redsocks_client(int client_fd) {
     close(proxy_fd);
   }
 
-
+  /*
   buf_size = read(client_fd, buf, sizeof(buf));
   printf("read from client: (%d)[%s], writing to proxy\n", buf_size, buf);
   write(proxy_fd, buf, buf_size);
+  */
 
   FD_ZERO(&active_set);
   FD_SET(proxy_fd, &active_set);
@@ -292,21 +290,13 @@ void redsocks_client(int client_fd) {
 
   while (1) {
     rd_set = active_set;
-    puts("what....");
     nsel = select(FD_SETSIZE, &rd_set, 0, 0, 0);
-    puts("selecting....");
     if (nsel < 0) {
-      puts("err selcting");
-      close(proxy_fd);
-      close(client_fd);
-      break;
+      goto done;
     } else if (nsel == 0) {
-      puts("no reply selecting");
       sleep(0);
       continue;
     }
-
-    printf("Got %d records!\n", nsel);
 
     for (i = 0; i < FD_SETSIZE; ++i) {
       if (!FD_ISSET(i, &rd_set))
@@ -384,9 +374,55 @@ int loop(int tunfd, int redsocksfd) {
   }
 }
 
+int print_help(const char *argv0) {
+  puts("Usage: ");
+  printf("    %s [OPTIONS]\n", argv0);
+  puts("\nOPTIONS:");
+  puts("    -x <http_proxy_ip>");
+  puts("    -p <http_proxy_port>");
+  puts("    -h\tDisplay this help");
+  exit(0);
+}
 
-int main() {
+int parse_arg(int argc, char **argv) {
+  int c;
+
+  while ((c = getopt(argc, argv, "hx:p:")) != -1) {
+    switch (c) {
+    case 'h':
+      print_help(argv[0]);
+      break;
+    case 'x':
+      http_proxy_ip = strdup(optarg);
+      break;
+    case 'p':
+      http_proxy_port = atoi(optarg);
+      break;
+    case '?':
+      fprintf(stderr, "Invalid option `-%c'\n", optopt);
+    default:
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int print_config() {
+  printf("HTTP proxy configured: %s:%d\n",
+         http_proxy_ip,
+         http_proxy_port);
+
+  return 0;
+}
+
+
+
+int main(int argc, char **argv) {
   int tunfd, redsocksfd;
+
+  parse_arg(argc, argv);
+  print_config();
 
   if ((tunfd = tun_alloc(dev)) < 0) {
     perror("tun_alloc");
