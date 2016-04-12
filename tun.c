@@ -47,7 +47,7 @@ int tun_alloc(const char *dev) {
 
   strncpy(ifr.ifr_name, dev, IFNAMSIZ);
 
-  if (ioctl(fd, TUNSETIFF, (void *) &ifr) < 0) {
+  if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
     close(fd);
     return -1;
   }
@@ -107,12 +107,13 @@ int redsocks_accept(int fd) {
 unsigned short ip_csum(const char *buf, int sz) {
   unsigned int sum = 0;
   int i;
-  for (i = 0; i < sz - 1; ++i) {
+  for (i = 0; i < sz - 1; i += 2) {
     sum += *(unsigned short *)&buf[i];
   }
   if (sz & 1) {
     sum += (unsigned char)buf[i];
   }
+
   sum = (sum & 0xFFFF) + (sum >> 16);
   return ~sum;
 }
@@ -142,12 +143,18 @@ int mangle_packet(struct iphdr *iph, struct tcphdr *tcph,
   iph->saddr = sip;
   iph->daddr = dip;
   iph->check = 0;
-  tcph->source = sport;
-  tcph->dest = dport;
+  tcph->source = htons(sport);
+  tcph->dest = htons(dport);
   tcph->check = 0;
 
   iph->check = ip_csum((char *)iph, sizeof(*iph));
-  tcph->check = tcp_csum((char *)tcph, iph->tot_len - sizeof(*iph));
+
+  tcph->check = tcp_csum((char *)tcph, ntohs(iph->tot_len) - sizeof(*iph));
+
+  fprintf(stderr,
+          "MANGLE: %s:%d -> %s:%d\n",
+          inet_ntoa(*(struct in_addr *)&sip), sport,
+          inet_ntoa(*(struct in_addr *)&dip), dport);
 
   return 0;
 }
@@ -187,6 +194,7 @@ int tun_forward(int fd) {
 
   if (sip == inet_addr(redsocks_ip) &&
       sport == redsocks_port) {
+    fprintf(stderr, "FROM REDSOCKS\n");
     /* packet is from redsocks */
     if ((sip = nat_ip[dport]) == 0)
       return -1;
@@ -194,6 +202,7 @@ int tun_forward(int fd) {
     dip = inet_addr(tun_ip);
     mangle_packet(iph, tcph, sip, sport, dip, dport);
   } else {
+    fprintf(stderr, "REAL PACKET\n");
     /* packet is to be forwarded */
     nat_ip[sport] = dip;
     nat_port[sport] = dport;
@@ -232,7 +241,7 @@ void redsocks_client(int client_fd) {
   }
 
   getpeername(client_fd, (struct sockaddr *)&source_addr, NULL);
-  source_port = source_addr.sin_port;
+  source_port = htons(source_addr.sin_port);
 
   memset(buf, 0, sizeof(buf));
   snprintf(buf, 2000,
